@@ -1,0 +1,530 @@
+---
+title: "Estimating a Linear Model and Plotting the Densities"
+output: pdf_document
+---
+
+The goal is here to estimate the coefficients of a linear model, with pareto distibuted errors, with the ordinary least squares (OLS) approach and methods using Bregman divergences. We will here compare the methods using the pseudo-Huber loss afunction nd the Huber loss functin separately. 
+
+# Error Function
+
+As a first step, we define an error function for Pareto-distributed errors. 
+We want this function to be symmetric and centered around zero. 
+```{r error_pareto_function, echo=TRUE}
+gen_pareto_error <- function(n, x_m, alpha) {
+  generate <- function(u, z) {
+    (x_m/(1-u)^(1/alpha)-x_m)*z
+  }
+  U <- runif(n)
+  Z <- (-1)^rbinom(n, 2, 0.5) 
+  sapply(1:n, function(k) generate(U[k], Z[k]))
+}
+```
+
+# Bregman Divergence
+As already mentioned we want to also use methods using Bregman divergences. Hence a suitable Bregman function has to be found. The criterions we are looking for are that the second derivative of the function $\phi(x)$ is constant near zero and decays to zero when $x$ goes to infinity. This is satisfied by the pseudo-Huber function, which is defined as
+$$ f_\delta (x) = \delta^2 \left(\sqrt{1 + \frac{x^2}{\delta^2}}-1\right).$$
+We choose this function for the generator function $\phi$ and implement the Bregman function and its gradients:
+```{r bregman_imp_function, echo=TRUE}
+# Define phi
+phi <- function(x, delta){
+  result_phi <- delta^2*(sqrt(1 + (x^2 / delta^2))-1)
+  return(sum(result_phi))
+}
+
+# Compute gradient of phi 
+grad_phi <- function(x, delta) {
+  result_grad_phi <- x/(sqrt(1 + (x/delta)^2))
+  return(result_grad_phi)
+}
+
+# Bregman divergence using phi and grad phi
+bregman_loss <- function(y, y_hat, delta) {
+  return(phi(y, delta) - phi(y_hat, delta) 
+         - sum(grad_phi(y_hat, delta) * (y - y_hat)))
+}
+```
+
+and as a last step we define the gradient of the Bregman divergence:
+```{r gradient, echo=TRUE}
+# Define gradient of Bregman function using the second derivative
+bregman_grad <- function(beta, y, x, delta) {
+  # Predict
+  y_hat <- cbind(1, x) %*% beta
+  # First derivative
+  g <- grad_phi(as.vector(y_hat), delta)
+  
+  # Second derivative
+  g_prime <- 1/(1 + (y_hat/delta)^2)^(3/2)
+  
+  # Gradient computation
+  residual <- as.vector(y - y_hat)
+  grad_term <- -g_prime * residual 
+  
+  # Return gradient w.r.t. beta
+  t(cbind(1, x)) %*% grad_term
+}
+```
+The next function we will use for $\phi$ is the Huber loss function. This funciton has the same desired properties as described before and is of the form 
+\begin{equation}
+  \phi_\delta (x) = \begin{cases}
+    \frac{1}{2}x^2 &\text{for }|x|\leq \delta \\
+    \delta \cdot (|x| - \frac{1}{2}\delta) &\text{otherwise}
+  \end{cases}
+\end{equation}
+As for the pseudo-Huber loss function, we also here want to define the Bregman divergence:
+```{r bregman_imp_function_huber, echo=TRUE}
+# Define phi 
+phi_huber <- function(x, delta){
+  result_phi <- ifelse(abs(x) <= delta, x^2/2, delta*(abs(x) - delta /2))
+  return(sum(result_phi))
+}
+
+# Compute gradient of phi 
+grad_phi_huber <- function(x, delta) {
+  result_grad_phi <- ifelse(abs(x) <= delta, x, delta*sign(x))
+  return(result_grad_phi)
+}
+
+# Bregman divergence using phi and grad phi 
+bregman_loss_huber <- function(y, y_hat, delta) {
+  return(phi_huber(y, delta) - phi_huber(y_hat, delta) 
+         - sum(grad_phi_huber(y_hat, delta) * (y - y_hat)))
+}
+```
+As a last step we also here define the gradient of the Bregman divergence:
+```{r gradient_huber, echo=TRUE}
+# Define gradient of Bregman function using the second derivative 
+bregman_grad_huber <- function(beta, y, x, delta) {
+  # Predict
+  y_hat <- cbind(1, x) %*% beta
+  # First derivative
+  g <- grad_phi_huber(as.vector(y_hat), delta)
+  
+  # Second derivative
+  g_prime <- ifelse(abs(y_hat) <= delta, 1, 0)
+  
+  # Gradient computation
+  residual <- as.vector(y - y_hat)
+  grad_term <- -g_prime * residual 
+  
+  # Return gradient w.r.t. beta
+  t(cbind(1, x)) %*% grad_term
+}
+```
+# Gernerate Data
+We write a function, which generates a linear model:
+```{r generate, echo=TRUE}
+generate_data <- function(n, true_slope, true_intercept, x_m, alpha){
+  x <- runif(n, 0, 10)
+  errors <- gen_pareto_error(n, x_m, alpha)
+  y <- true_intercept + true_slope*x + errors
+  list(x = x, y = y)
+}
+```
+
+# OLS
+We fit the linear model using ordinary least squares:
+```{r ols_sim, echo=TRUE}
+fit_ols <- function(x,y){
+  model <- lm(y ~ x)
+  pred <- predict(model)
+  list(coef = coef(model), pred = pred)
+}
+```
+
+# Bregman
+Next, we fit the Bregman-based model using the pseudo-Huber loss function:
+```{r bregman_sim, echo=TRUE}
+fit_bregman <- function(x, y, delta) {
+  current_loss <- function(beta) {
+    y_hat <- cbind(1, x) %*% beta
+    bregman_loss(y, y_hat, delta)
+  }
+  current_grad <- function(beta) {
+    bregman_grad(beta, y, x, delta)
+  }
+  init_beta <- coef(MASS::rlm(y ~ x))
+  result <- optim(
+    par = init_beta,
+    fn = current_loss,
+    gr = current_grad,
+    method = "L-BFGS-B",
+    control = list(maxit = 1000, trace = 0, reltol = 1e-8)
+  )
+  coef <- result$par
+  pred <- cbind(1, x) %*% coef
+  list(coef = coef, pred = pred)
+}
+```
+Now we do the same for the Huber loss function:
+```{r bregman_sim_huber, echo=TRUE}
+fit_bregman_huber <- function(x, y, delta) {
+  current_loss <- function(beta) {
+    y_hat <- cbind(1, x) %*% beta
+    bregman_loss_huber(y, y_hat, delta)
+  }
+  current_grad <- function(beta) {
+    bregman_grad_huber(beta, y, x, delta)
+  }
+  init_beta <- coef(MASS::rlm(y ~ x))
+  result <- optim(
+    par = init_beta,
+    fn = current_loss,
+    method = "BFGS",
+    control = list(maxit = 1000, trace = 0, reltol = 1e-8)
+  )
+  coef <- result$par
+  pred <- cbind(1, x) %*% coef
+  list(coef = coef, pred = pred)
+}
+```
+# Set Parameters
+After having defined those functions, we set values for the parameters:
+```{r values, echo=TRUE}
+set.seed(1)
+n <- 100
+true_intercept <- 1
+true_slope <- 1
+x_m <- 1
+alpha <- 1.2
+delta <- 0.3
+n_sim <- 1000  # Number of simulations
+```
+
+# Simulation and Storing of Data
+The next step is to simulate the data:
+```{r simulation_function, echo=TRUE, message=FALSE, warning=FALSE}
+# Main simulation function
+run_simulation <- function(n_sim, n, true_intercept, true_slope, x_m, alpha, delta) {
+  # Initialize storage for results
+  results <- vector("list", n_sim)
+  
+  for (i in 1:n_sim) {
+    # Generate data
+    data <- generate_data(n, true_slope, true_intercept, x_m, alpha)
+    x <- data$x
+    y <- data$y
+    
+    # Fit OLS
+    ols <- fit_ols(x, y)
+    
+    # Fit Bregman
+    bregman <- fit_bregman(x, y, delta)
+    bregman_huber <- fit_bregman_huber(x, y, delta)
+    
+    # Store results
+    results[[i]] <- list(
+      x = x,
+      y = y,
+      ols_coef = ols$coef,
+      bregman_coef = bregman$coef,
+      bregman_huber_coef = bregman_huber$coef,
+      ols_pred = ols$pred,
+      bregman_pred = bregman$pred,
+      bregman_huber_pred = bregman_huber$pred,
+      ols_mse = mean((y - ols$pred)^2),
+      bregman_mse = mean((y - bregman$pred)^2),
+      bregman_huber_mse = mean((y - bregman_huber$pred)^2),
+      ols_mad = median(abs(y - ols$pred)),
+      bregman_mad = median(abs(y - bregman$pred)),
+      bregman_huber_mad = median(abs(y - bregman_huber$pred)),
+      ols_bregman = bregman_loss(y, ols$pred, delta),
+      bregman_bregman = bregman_loss(y, bregman$pred, delta),
+      bregman_huber_bregman = bregman_loss(y, bregman_huber$pred, delta)
+    )
+  }
+  
+  # Aggregate results
+  ols_intercepts <- sapply(results, function(res) res$ols_coef[1])
+  ols_slopes <- sapply(results, function(res) res$ols_coef[2])
+  bregman_intercepts <- sapply(results, function(res) res$bregman_coef[1])
+  bregman_huber_intercepts <- sapply(results, function(res) res$bregman_huber_coef[1])
+  bregman_slopes <- sapply(results, function(res) res$bregman_coef[2])
+  bregman_huber_slopes <- sapply(results, function(res) res$bregman_huber_coef[2])
+  ols_mse <- sapply(results, function(res) res$ols_mse)
+  bregman_mse <- sapply(results, function(res) res$bregman_mse)
+  bregman_huber_mse <- sapply(results, function(res) res$bregman_huber_mse)
+  ols_mad <- sapply(results, function(res) res$ols_mad)
+  bregman_mad <- sapply(results, function(res) res$bregman_mad)
+  bregman_huber_mad <- sapply(results, function(res) res$bregman_huber_mad)
+  ols_bregman_loss <- sapply(results, function(res) res$ols_bregman)
+  bregman_bregman_loss <- sapply(results, function(res) res$bregman_bregman)
+  bregman_huber_bregman_loss <- sapply(results, function(res) res$bregman_huber_bregman)
+  
+  # Find simulation closest to median Bregman slope
+  median_bregman_slope <- median(bregman_slopes)
+  closest_sim <- which.min(abs(bregman_slopes - median_bregman_slope))
+  sim_result <- results[[closest_sim]]
+  
+  # Prepare summary data frame
+  results_summary <- data.frame(
+    x = sim_result$x,
+    y = sim_result$y,
+    ols_pred = sim_result$ols_pred,
+    bregman_pred = sim_result$bregman_pred,
+    bregman_huber_pred = sim_result$bregman_huber_pred,
+    ols_intercept_median = median(ols_intercepts),
+    ols_slope_median = median(ols_slopes),
+    bregman_intercept_median = median(bregman_intercepts),
+    bregman_huber_intercept_median = median(bregman_huber_intercepts),
+    bregman_slope_median = median(bregman_slopes),
+    bregman_huber_slope_median = median(bregman_huber_slopes),
+    ols_mse_median = median(ols_mse),
+    bregman_mse_median = median(bregman_mse),
+    bregman_huber_mse_median = median(bregman_huber_mse),
+    ols_mad_median = median(ols_mad),
+    bregman_mad_median = median(bregman_mad),
+    bregman_huber_mad_median = median(bregman_huber_mad),
+    ols_bregman_median = median(ols_bregman_loss),
+    bregman_bregman_median = median(bregman_bregman_loss),
+    bregman_huber_bregman_median = median(bregman_huber_bregman_loss)
+  )
+  
+  list(results_summary = results_summary, all_results = results)
+}
+
+# Run simulations
+sim_data <- run_simulation(n_sim, n, true_intercept, true_slope, x_m, alpha, delta)
+results_summary <- sim_data$results_summary
+```
+
+# Plot Estimates and State Results
+```{r plot_simulation, echo=TRUE, message=FALSE, warning=FALSE}
+# Load libraries
+library(ggplot2)
+library(parallel)
+library(foreach)
+library(doParallel)
+
+# Sort data by x for smooth plotting
+plot_data <- results_summary[order(results_summary$x), ]
+
+
+# Plot data for the pseudo-Huber loss 
+ggplot() +
+  geom_point(aes(x = plot_data$x, y = plot_data$y), color = "gray50", alpha = 0.7) +
+  geom_line(aes(x = plot_data$x, y = plot_data$ols_pred, color = "OLS"), linewidth = 1) +
+  geom_line(aes(x = plot_data$x, y = plot_data$bregman_pred, color = "Bregman"), 
+            linewidth = 1, linetype = "dashed") +
+  geom_line(aes(x = plot_data$x, y = true_intercept + true_slope*plot_data$x, 
+                color = "True Relationship"), linewidth = 1, linetype = "dashed") +
+  scale_color_manual(values = c("OLS" = "red", "Bregman" = "blue", 
+                                "True Relationship" = "green")) +
+  labs(title = "Comparison of Regression Methods Using the Pseudo-Huber Loss",
+       x = "Predictor (x)", y = "Response (y)",
+       color = "Method") +
+  theme_minimal() +
+  theme(legend.position = "top")
+
+# Plot data for the Huber loss
+ggplot() +
+  geom_point(aes(x = plot_data$x, y = plot_data$y), color = "gray50", alpha = 0.7) +
+  geom_line(aes(x = plot_data$x, y = plot_data$ols_pred, color = "OLS"), linewidth = 1) +
+  geom_line(aes(x = plot_data$x, y = plot_data$bregman_huber_pred, color = "Bregman"), 
+            linewidth = 1, linetype = "dashed") +
+  geom_line(aes(x = plot_data$x, y = true_intercept + true_slope*plot_data$x, 
+                color = "True Relationship"), linewidth = 1, linetype = "dashed") +
+  scale_color_manual(values = c("OLS" = "red", "Bregman" = "blue", 
+                                "True Relationship" = "green")) +
+  labs(title = "Comparison of Regression Methods Using the Huber Loss",
+       x = "Predictor (x)", y = "Response (y)",
+       color = "Method") +
+  theme_minimal() +
+  theme(legend.position = "top")
+```
+
+We now state our numerical results to have a more precise comparison:
+```{r results, echo=FALSE}
+cat("OLS Intercept: Median =", results_summary$ols_intercept_median[1], "\n")
+cat("Bregman Intercept using the pseudo-Huber loss: Median =", results_summary$bregman_intercept_median[1], "\n")
+cat("Bregman Intercept using the Huber loss: Median =", results_summary$bregman_huber_intercept_median[1], "\n")
+cat("OLS Slope: Median =", results_summary$ols_slope_median[1], "\n")
+cat("Bregman Slope using the pseudo-Huber loss function: Median =", results_summary$bregman_slope_median[1], "\n")
+cat("Bregman Slope using the Huber loss function: Median =", results_summary$bregman_huber_slope_median[1], "\n")
+cat("OLS MSE: Median =", results_summary$ols_mse_median[1], "\n")
+cat("Bregman MSE using the pseudo-Huber loss function: Median =", results_summary$bregman_mse_median[1], "\n")
+cat("Bregman MSE using the Huber loss function: Median =", results_summary$bregman_huber_mse_median[1], "\n")
+cat("OLS MAD: Median =", results_summary$ols_mad_median[1], "\n")
+cat("Bregman MAD usinn the pseudo-Huber loss function: Median =", results_summary$bregman_mad_median[1], "\n")
+cat("Bregman MAD using the Huber loss function: Median =", results_summary$bregman_huber_mad_median[1], "\n")
+cat("OLS slope difference =", abs(results_summary$ols_slope_median[1] - true_slope), "\n")
+cat("Bregman slope difference using the pseudo-Huber loss function=", abs(results_summary$bregman_slope_median[1] - true_slope), "\n")
+cat("Bregman slope difference using the Huber loss function=", abs(results_summary$bregman_huber_slope_median[1] - true_slope), "\n")
+cat("OLS intercept difference =", abs(results_summary$ols_intercept_median[1] - true_intercept), "\n")
+cat("Bregman intercept difference using the pseudo-Huber loss function =", abs(results_summary$bregman_intercept_median[1] - true_intercept), "\n")
+cat("Bregman intercept difference using the Huber loss function=", abs(results_summary$bregman_huber_intercept_median[1] - true_intercept), "\n")
+```
+We run the simulations in parallel to plot the densities of the slopes and intercepts:
+```{r run_parallel, echo=TRUE}
+# Run parallel simulations
+run_parallel_simulations <- 
+  function(n_sim, n, true_intercept, true_slope, x_m, alpha, delta, num_cores = detectCores() - 1) {
+  # Set up parallel backend
+  cl <- makeCluster(num_cores)
+  registerDoParallel(cl)
+  
+  # Run simulations in parallel
+  sim_results <- foreach(
+    i = 1:n_sim,
+    .packages = c("stats", "MASS"),
+    .export = c("generate_data", "gen_pareto_error", "fit_ols", 
+                "fit_bregman", "fit_bregman_huber",
+                "phi", "grad_phi", "bregman_loss", "bregman_grad",
+                "phi_huber", "grad_phi_huber", "bregman_loss_huber", "bregman_grad_huber")
+  ) %dopar% {
+    data <- generate_data(n, true_slope, true_intercept, x_m, alpha)
+    if (any(is.na(data$y)) || any(is.infinite(data$y))) return(NULL)
+    
+    ols <- fit_ols(data$x, data$y)
+    bregman <- fit_bregman(data$x, data$y, delta)
+    bregman_huber <- fit_bregman_huber(data$x, data$y, delta)
+    
+    if (any(is.na(c(ols$coef, bregman$coef, bregman_huber$coef)))) return(NULL)
+    
+    list(
+      ols_coef = ols$coef,
+      bregman_coef = bregman$coef,
+      bregman_huber_coef = bregman_huber$coef,
+      ols_mse = mean((data$y - ols$pred)^2),
+      bregman_mse = mean((data$y - bregman$pred)^2),
+      bregman_huber_mse = mean((data$y - bregman_huber$pred)^2),
+      ols_mad = median(abs(data$y - ols$pred)),
+      bregman_mad = median(abs(data$y - bregman$pred)),
+      bregman_huber_mad = median(abs(data$y - bregman_huber$pred)),
+      ols_bregman = bregman_loss(data$y, ols$pred, delta),
+      bregman_bregman = bregman_loss(data$y, bregman$pred, delta),
+      bregman_huber_bregman = bregman_loss(data$y, bregman_huber$pred, delta)
+    )
+  }
+  
+  # Stop cluster
+  stopCluster(cl)
+  
+  # Filter out NULL results
+  sim_results <- sim_results[!sapply(sim_results, is.null)]
+  
+  return(sim_results)
+}
+
+# Run simulations
+sim_results <- run_parallel_simulations(n_sim, n, true_intercept, 
+                                        true_slope, x_m, alpha, delta)
+
+# Process results
+results_summary_sim <- data.frame(
+  simulation = seq_along(sim_results),
+  ols_intercept = sapply(sim_results, function(r) r$ols_coef[1]),
+  ols_slope = sapply(sim_results, function(r) r$ols_coef[2]),
+  bregman_intercept = sapply(sim_results, function(r) r$bregman_coef[1]),
+  bregman_slope = sapply(sim_results, function(r) r$bregman_coef[2]),
+  bregman_huber_intercept = sapply(sim_results, function(r) r$bregman_huber_coef[1]),
+  bregman_huber_slope = sapply(sim_results, function(r) r$bregman_huber_coef[2]),
+  ols_mse = sapply(sim_results, function(r) r$ols_mse),
+  bregman_mse = sapply(sim_results, function(r) r$bregman_mse),
+  bregman_huber_mse = sapply(sim_results, function(r) r$bregman_huber_mse),
+  ols_mad = sapply(sim_results, function(r) r$ols_mad),
+  bregman_mad = sapply(sim_results, function(r) r$bregman_mad),
+  bregman_huber_mad = sapply(sim_results, function(r) r$bregman_huber_mad),
+  ols_bregman = sapply(sim_results, function(r) r$ols_bregman),
+  bregman_bregman = sapply(sim_results, function(r) r$bregman_bregman),
+  bregman_huber_bregman = sapply(sim_results, function(r) r$bregman_huber_bregman)
+)
+```
+Now we want to look at the performance of the estimators by plotting the densities. First, we plot the densities we get when using the pseudo-Huber loss function:
+```{r psuedo_huber_plots, echo=TRUE, message=FALSE, warning=FALSE}
+# Plot density of OLS and Bregman intercept estimates ----
+ggplot(results_summary_sim) +
+  geom_density(aes(x = ols_intercept, fill = "OLS"), alpha = 0.4) +
+  geom_density(aes(x = bregman_intercept, fill = "Bregman"), alpha = 0.4) +
+  geom_vline(aes(xintercept = true_intercept), linetype = "dashed", color = "black") +
+  scale_fill_manual(values = c("OLS" = "red", "Bregman" = "cyan")) +
+  labs(title = "Density of Intercept Estimates Using the Pseudo-Huber Loss",
+       subtitle = paste("True Intercept =", true_intercept),
+       x = "Intercept Estimate", 
+       y = "Density",
+       fill = "Method") +
+  xlim(-10, 10) +
+  theme_minimal() +
+  theme(legend.position = "top")
+
+# Plot slope densities using the Pseudo-Huber loss
+ggplot(results_summary_sim) +
+  geom_density(aes(x = ols_slope, fill = "OLS"), alpha = 0.4) +
+  geom_density(aes(x = bregman_slope, fill = "Bregman"), alpha = 0.4) +
+  geom_vline(aes(xintercept = true_slope), linetype = "dashed", color = "black") +
+  scale_fill_manual(values = c("OLS" = "red", "Bregman" = "cyan")) +
+  labs(title = "Density of Slope Estimates Using the Pseudo-Huber Loss",
+       subtitle = paste("True Slope =", true_slope),
+       x = "Slope Estimate", 
+       y = "Density",
+       fill = "Method") +
+  xlim(-10, 10) +
+  theme_minimal() +
+  theme(legend.position = "top")
+```
+And we do the same for using the Huber loss function
+```{r huber_plots, echo=TRUE, message=FALSE, warning=FALSE}
+# Plot density of OLS and Bregman intercept estimates ----
+ggplot(results_summary_sim) +
+  geom_density(aes(x = ols_intercept, fill = "OLS"), alpha = 0.4) +
+  geom_density(aes(x = bregman_huber_intercept, fill = "Bregman"), alpha = 0.4) +
+  geom_vline(aes(xintercept = true_intercept), linetype = "dashed", color = "black") +
+  scale_fill_manual(values = c("OLS" = "red", "Bregman" = "blue")) +
+  labs(title = "Density of Intercept Estimates Using the Huber Loss",
+       subtitle = paste("True Intercept =", true_intercept),
+       x = "Intercept Estimate", 
+       y = "Density",
+       fill = "Method") +
+  xlim(-10, 10) +
+  theme_minimal() +
+  theme(legend.position = "top")
+
+# Plot slope densities using the Huber loss
+ggplot(results_summary_sim) +
+  geom_density(aes(x = ols_slope, fill = "OLS"), alpha = 0.4) +
+  geom_density(aes(x = bregman_huber_slope, fill = "Bregman"), alpha = 0.4) +
+  geom_vline(aes(xintercept = true_slope), linetype = "dashed", color = "black") +
+  scale_fill_manual(values = c("OLS" = "red", "Bregman" = "blue")) +
+  labs(title = "Density of Slope Estimates Using the Huber loss",
+       subtitle = paste("True Slope =", true_slope),
+       x = "Slope Estimate", 
+       y = "Density",
+       fill = "Method") +
+  xlim(-10, 10) +
+  theme_minimal() +
+  theme(legend.position = "top")
+
+# Plot intercept densities using all loss functions
+ggplot(results_summary_sim) +
+  geom_density(aes(x = ols_intercept, fill = "OLS"), alpha = 0.4) +
+  geom_density(aes(x = bregman_huber_intercept, fill = "Bregman Huber"), alpha = 0.4) +
+  geom_density(aes(x = bregman_intercept, fill = "Bregman Pseudo-Huber"), alpha = 0.4) +
+  geom_vline(aes(xintercept = true_intercept), linetype = "dashed", color = "black") +
+  scale_fill_manual(values = c("OLS" = "red", "Bregman Huber" = "blue", 
+                               "Bregman Pseudo-Huber" = "cyan")) +
+  labs(title = "Density of Intercept Estimates",
+       subtitle = paste("True Intercept =", true_intercept),
+       x = "Intercept Estimate", 
+       y = "Density",
+       fill = "Method") +
+  xlim(-10, 10) +
+  theme_minimal() +
+  theme(legend.position = "top")
+
+# Plot slope densities using all loss functions
+ggplot(results_summary_sim) +
+  geom_density(aes(x = ols_slope, fill = "OLS"), alpha = 0.4) +
+  geom_density(aes(x = bregman_huber_slope, fill = "Bregman Huber"), alpha = 0.4) +
+  geom_density(aes(x = bregman_slope, fill = "Bregman Pseudo-Huber"), alpha = 0.4) +
+  geom_vline(aes(xintercept = true_slope), linetype = "dashed", color = "black") +
+  scale_fill_manual(values = c("OLS" = "red", "Bregman Huber" = "blue", 
+                               "Bregman Pseudo-Huber" = "cyan")) +
+  labs(title = "Density of Slope Estimates",
+       subtitle = paste("True Slope =", true_slope),
+       x = "Slope Estimate", 
+       y = "Density",
+       fill = "Method") +
+  xlim(-2, 3) +
+  theme_minimal() +
+  theme(legend.position = "top")
+```

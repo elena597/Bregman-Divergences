@@ -1,0 +1,353 @@
+---
+title: "Modified MSE and MAD for Varying Deltas and Fixed Intercepts and Slopes"
+output:
+  pdf_document: default
+  html_document: default
+---
+
+In this file, we will compare the performance of the methods using Bregman divergences for fixed slopes or intercepts and varying deltas. The performance will be measured by modified versions of the median squared error and the median absolute deviation. 
+
+## Error Function
+We define a symmetric, zero-centered Pareto error distribution:
+
+```{r gen_error, echo=TRUE}
+gen_pareto_error <- function(n, x_m, alpha) {
+  generate <- function(u, z) {
+    (x_m/(1-u)^(1/alpha)-x_m)*z
+  }
+  U <- runif(n)
+  Z <- (-1)^rbinom(n, 2, 0.5)
+  sapply(1:n, function(k) generate(U[k], Z[k]))
+}
+```
+
+## Bregman Divergence Using the Pseudo-Huber Loss
+We implement the pseudo-Huber loss function as the Bregman function \(\phi\), along with its gradient and divergence:
+
+```{r bregman, echo=TRUE}
+# Define phi
+phi <- function(x, delta) {
+  result_phi <- delta^2 * (sqrt(1 + (x^2 / delta^2)) - 1)
+  return(sum(result_phi))
+}
+
+# Compute gradient of phi
+grad_phi <- function(x, delta) {
+  result_grad_phi <- x / sqrt(1 + (x/delta)^2)
+  return(result_grad_phi)
+}
+
+# Bregman divergence
+bregman_loss <- function(y, y_hat, delta) {
+  return(phi(y, delta) - phi(y_hat, delta) - sum(grad_phi(y_hat, delta) * (y - y_hat)))
+}
+
+# Gradient of Bregman divergence
+bregman_grad <- function(beta, y, x, delta) {
+  y_hat <- cbind(1, x) %*% beta
+  g <- grad_phi(as.vector(y_hat), delta)
+  g_prime <- delta^2 / (delta^2 + y_hat^2)^(3/2)
+  residual <- as.vector(y - y_hat)
+  grad_term <- -g_prime * residual
+  t(cbind(1, x)) %*% grad_term
+}
+```
+# Bregman Divergence Using the Huber Loss Function
+We do the same for the Huber loss function:
+```{r bregman_imp_function_huber, echo=TRUE}
+# Define phi 
+phi_huber <- function(x, delta){
+  result_phi <- ifelse(abs(x) <= delta, x^2/2, delta*(abs(x) - delta /2))
+  return(sum(result_phi))
+}
+
+# Compute gradient of phi 
+grad_phi_huber <- function(x, delta) {
+  result_grad_phi <- ifelse(abs(x) <= delta, x, delta*sign(x))
+  return(result_grad_phi)
+}
+
+# Bregman divergence using phi and grad phi 
+bregman_loss_huber <- function(y, y_hat, delta) {
+  return(phi_huber(y, delta) - phi_huber(y_hat, delta) 
+         - sum(grad_phi_huber(y_hat, delta) * (y - y_hat)))
+}
+```
+As a last step we also here define the gradient of the Bregman divergence:
+```{r gradient_huber, echo=TRUE}
+# Define gradient of Bregman function using the second derivative
+bregman_grad_huber <- function(beta, y, x, delta) {
+  # Predict
+  y_hat <- cbind(1, x) %*% beta
+  # First derivative
+  g <- grad_phi_huber(as.vector(y_hat), delta)
+  
+  # Second derivative
+  g_prime <- ifelse(abs(y_hat) <= delta, 1, 0)
+  
+  # Gradient computation
+  residual <- as.vector(y - y_hat)
+  grad_term <- -g_prime * residual 
+  
+  # Return gradient w.r.t. beta
+  t(cbind(1, x)) %*% grad_term
+}
+```
+## Generate Data
+We generate data for a linear model with Pareto errors:
+
+```{r gen, echo=TRUE}
+generate_data <- function(n, true_slope, true_intercept, x_m, alpha) {
+  x <- runif(n, 0, 10)
+  errors <- gen_pareto_error(n, x_m, alpha)
+  y <- true_intercept + true_slope * x + errors
+  list(x = x, y = y)
+}
+```
+
+## OLS
+We implement OLS estimation using `lm`:
+
+```{r ols_fit, echo=TRUE}
+fit_ols <- function(x, y) {
+  model <- lm(y ~ x)
+  pred <- predict(model)
+  list(coef = coef(model), pred = pred)
+}
+```
+
+## Bregman
+We implement Bregman estimation using the pseudo-Huber loss function:
+```{r bregman_fit, echo=TRUE}
+fit_bregman <- function(x, y, delta) {
+  current_loss <- function(beta) {
+    y_hat <- cbind(1, x) %*% beta
+    bregman_loss(y, y_hat, delta)
+  }
+  current_grad <- function(beta) {
+    bregman_grad(beta, y, x, delta)
+  }
+  init_beta <- coef(MASS::rlm(y ~ x))
+  result <- optim(
+    par = init_beta,
+    fn = current_loss,
+    gr = current_grad,
+    method = "L-BFGS-B",
+    control = list(maxit = 1000, trace = 0, reltol = 1e-8)
+  )
+  coef <- result$par
+  pred <- cbind(1, x) %*% coef
+  list(coef = coef, pred = pred)
+}
+```
+We do the same for the Huber loss function:
+```{r bregman_sim_huber, echo=TRUE}
+fit_bregman_huber <- function(x, y, delta) {
+  current_loss <- function(beta) {
+    y_hat <- cbind(1, x) %*% beta
+    bregman_loss_huber(y, y_hat, delta)
+  }
+  current_grad <- function(beta) {
+    bregman_grad_huber(beta, y, x, delta)
+  }
+  init_beta <- coef(MASS::rlm(y ~ x))
+  result <- optim(
+    par = init_beta,
+    fn = current_loss,
+    method = "BFGS",
+    control = list(maxit = 1000, trace = 0, reltol = 1e-8)
+  )
+  coef <- result$par
+  pred <- cbind(1, x) %*% coef
+  list(coef = coef, pred = pred)
+}
+```
+## Set Parameters
+We define parameters, including a grid for the values for delta:
+```{r paremeters, echo=TRUE}
+set.seed(1)
+n <- 100
+x_m <- 1
+alpha <- 1.2
+delta_values <- seq(0.1, 10, length.out = 100)
+n_sim <- 100 
+true_intercept <- 1
+true_slope <- 1
+```
+## Simulation Function
+We define two measures we use to measure the performance of the estimator. We will denote the true slope as $m$ and the estimated slope as $\widehat{m}$. 
+
+The first measure we will use is a deformed version of the MSE and is denfined as 
+$$\frac{\sqrt{\mathrm{median}[(\widehat{m}(\delta) - m)^2]}}{m}$$
+
+The next measure, we define is a modified version of the median absolute deviation and is given by the formula
+$$\frac{\mathrm{median}[|\widehat{m}(\delta) - m|]}{m}$$
+```{r simu, echo=TRUE, warning=FALSE, message=FALSE}
+run_simulation <- function(n_sim, n, true_intercept, true_slope, x_m, alpha, delta_values) {
+  # Initialize results storage
+  results <- expand.grid(
+    true_delta = delta_values,
+    mse_mod_bregman = NA,
+    mse_mod_bregman_int = NA,
+    mse_mod_bregman_huber = NA,
+    mse_mod_bregman_huber_int = NA,
+    mad_mod_bregman = NA,
+    mad_mod_bregman_int = NA,
+    mad_mod_bregman_huber = NA,
+    mad_mod_bregman_huber_int = NA,
+    mse_mod_ols = NA,
+    mse_mod_ols_int = NA,
+    mad_mod_ols = NA,
+    mad_mod_ols_int = NA
+  )
+
+  # Generate all data and OLS fits 
+  data_all <- vector("list", n_sim)
+  ols_all <- vector("list", n_sim)
+  for (j in 1:n_sim) {
+    data_all[[j]] <- generate_data(n, true_slope, true_intercept, x_m, alpha)
+    ols_all[[j]] <- fit_ols(data_all[[j]]$x, data_all[[j]]$y)
+  }
+
+  # Now loop over each delta
+  for (i in seq_len(nrow(results))) {
+    true_delta <- results$true_delta[i]
+
+    mse_mod_bregman <- numeric(n_sim)
+    mse_mod_bregman_int <- numeric(n_sim)
+    mse_mod_bregman_huber <- numeric(n_sim)
+    mse_mod_bregman_huber_int <- numeric(n_sim)
+    mad_mod_bregman <- numeric(n_sim)
+    mad_mod_bregman_int <- numeric(n_sim)
+    mad_mod_bregman_huber <- numeric(n_sim)
+    mad_mod_bregman_huber_int <- numeric(n_sim)
+    mse_mod_ols <- numeric(n_sim)
+    mse_mod_ols_int <- numeric(n_sim)
+    mad_mod_ols <- numeric(n_sim)
+    mad_mod_ols_int <- numeric(n_sim)
+
+    for (j in 1:n_sim) {
+      data <- data_all[[j]]
+      ols <- ols_all[[j]]
+
+      bregman <- fit_bregman(data$x, data$y, true_delta)
+      bregman_huber <- fit_bregman_huber(data$x, data$y, true_delta)
+
+      mse_mod_bregman[j] <- (bregman$coef[2] - true_slope)^2
+      mse_mod_bregman_int[j] <- (bregman$coef[1] - true_intercept)^2
+      mse_mod_bregman_huber[j] <- (bregman_huber$coef[2] - true_slope)^2
+      mse_mod_bregman_huber_int[j] <- (bregman_huber$coef[1] - true_intercept)^2
+      mad_mod_bregman[j] <- abs(bregman$coef[2] - true_slope)
+      mad_mod_bregman_int[j] <- abs(bregman$coef[1] - true_intercept)
+      mad_mod_bregman_huber[j] <- abs(bregman_huber$coef[2] - true_slope)
+      mad_mod_bregman_huber_int[j] <- abs(bregman_huber$coef[1] - true_intercept)
+      mse_mod_ols[j] <- (ols$coef[2] - true_slope)^2
+      mse_mod_ols_int[j] <- (ols$coef[1] - true_intercept)^2
+      mad_mod_ols[j] <- abs(ols$coef[2] - true_slope)
+      mad_mod_ols_int[j] <- abs(ols$coef[1] - true_intercept)
+    }
+
+    # Save median statistics
+    results$mse_mod_bregman[i] <- 
+      sqrt(median(mse_mod_bregman, na.rm = TRUE)) / true_slope
+    results$mse_mod_bregman_int[i] <- 
+      sqrt(median(mse_mod_bregman_int, na.rm = TRUE)) / true_intercept
+    results$mse_mod_bregman_huber[i] <- 
+      sqrt(median(mse_mod_bregman_huber, na.rm = TRUE)) / true_slope
+    results$mse_mod_bregman_huber_int[i] <- 
+      sqrt(median(mse_mod_bregman_huber_int, na.rm = TRUE)) / true_intercept
+    results$mad_mod_bregman[i] <- 
+      median(mad_mod_bregman, na.rm = TRUE) / true_slope
+    results$mad_mod_bregman_int[i] <- 
+      median(mad_mod_bregman_int, na.rm = TRUE) / true_intercept
+    results$mad_mod_bregman_huber[i] <- 
+      median(mad_mod_bregman_huber, na.rm = TRUE) / true_slope
+    results$mad_mod_bregman_huber_int[i] <- 
+      median(mad_mod_bregman_huber_int, na.rm = TRUE) / true_intercept
+    results$mse_mod_ols[i] <- sqrt(median(mse_mod_ols, na.rm = TRUE)) / true_slope
+    results$mse_mod_ols_int[i] <- sqrt(median(mse_mod_ols_int, na.rm = TRUE)) / true_intercept
+    results$mad_mod_ols[i] <- median(mad_mod_ols, na.rm = TRUE) / true_slope
+    results$mad_mod_ols_int[i] <- median(mad_mod_ols_int, na.rm = TRUE) / true_intercept
+  }
+
+  return(results)
+}
+
+```
+
+## Run Simulation
+We run the simulation:
+
+```{r sim, echo=TRUE, message=FALSE, warning=FALSE}
+sim_results <- run_simulation(n_sim, n, true_intercept, true_slope, x_m, alpha, delta_values)
+```
+
+## Create Plots
+
+```{r int_plot_mad, echo=TRUE}
+library(ggplot2)
+# Make plot for modified MSE with fixed intercept
+ggplot(sim_results, aes(x = delta_values)) +
+  geom_line(aes(y = mse_mod_bregman_int, color = "Pseudo-Huber Loss")) +
+  geom_line(aes(y = mse_mod_bregman_huber_int, color = "Huber Loss")) +
+  geom_line(aes(y = mse_mod_ols_int, color = "OLS")) +
+  scale_color_manual(
+    values = c("Pseudo-Huber Loss" = "cyan", "Huber Loss" = "blue", "OLS" = "red")
+  ) + 
+  labs(
+    title = "Modified MSE for Different Deltas and Fixed Intercept",
+    x = "Delta",
+    y = "Modified MSE",
+    color = "Method"
+  ) +
+  theme_minimal()
+
+# Plot modified MSE for fixed slope
+ggplot(sim_results, aes(x = delta_values)) +
+  geom_line(aes(y = mse_mod_bregman, color = "Pseudo-Huber Loss")) +
+  geom_line(aes(y = mse_mod_bregman_huber, color = "Huber Loss")) +
+  geom_line(aes(y = mse_mod_ols, color = "OLS")) +
+  scale_color_manual(
+    values = c("Pseudo-Huber Loss" = "cyan", "Huber Loss" = "blue", "OLS" = "red")
+  ) + 
+  labs(
+    title = "Modified MSE for Different Deltas and Fixed Slope",
+    x = "Delta",
+    y = "Modified MSE",
+    color = "Method"
+  ) +
+  theme_minimal()
+
+# Plot modified MAD for fixed intercepts
+ggplot(sim_results, aes(x = true_delta)) +
+  geom_line(aes(y = mad_mod_bregman_int, color = "Pseudo-Huber Loss")) +
+  geom_line(aes(y = mad_mod_bregman_huber_int, color = "Huber Loss")) +
+  geom_line(aes(y = mad_mod_ols_int , color = "OLS")) +
+  scale_color_manual(
+    values = c("Pseudo-Huber Loss" = "cyan", "Huber Loss" = "blue", "OLS" = "red")
+  ) + 
+  labs(
+    title = "Modified MAD for Different Deltas and Fixed Intercept",
+    x = "Delta",
+    y = "Modified MAD",
+    color = "Method"
+  ) +
+  theme_minimal()
+
+# Plot modified MAD for fixed slope
+ggplot(sim_results, aes(x = delta_values)) +
+  geom_line(aes(y = mad_mod_bregman, color = "Pseudo-Huber Loss")) +
+  geom_line(aes(y = mad_mod_bregman_huber, color = "Huber Loss")) +
+  geom_line(aes(y = mad_mod_ols, color = "OLS")) +
+  scale_color_manual(
+    values = c("Pseudo-Huber Loss" = "cyan", "Huber Loss" = "blue", "OLS" = "red")
+  ) + 
+  labs(
+    title = "Modified MAD for Different Deltas and Fixed Slope",
+    x = "Delta",
+    y = "Modified MAD",
+    color = "Method"
+  ) +
+  theme_minimal()
+
+```

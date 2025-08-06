@@ -1,0 +1,468 @@
+---
+title: "CV"
+output:
+  pdf_document: default
+  html_document: default
+  word_document: default
+---
+In this file, we will choose the most suitable value for `delta` by using K-fold cross-validation. We will select the best `delta` for both the Pseudo-Huber and Huber loss functions, using the modified MSE and the modified MAD as performance metrics. We will generate 100 datasets and average the results to ensure robust estimates.
+
+## Error Function
+We define a symmetric, zero-centered Pareto error distribution:
+
+```{r gen_error, echo=TRUE}
+gen_pareto_error <- function(n, x_m, alpha) {
+  generate <- function(u, z) {
+    (x_m/(1-u)^(1/alpha)-x_m)*z
+  }
+  U <- runif(n)
+  Z <- (-1)^rbinom(n, 2, 0.5)
+  sapply(1:n, function(k) generate(U[k], Z[k]))
+}
+```
+
+## Bregman Divergence
+We implement the Pseudo-Huber loss as the Bregman function \(\phi\), along with its gradient and divergence:
+
+```{r bregman, echo=TRUE}
+# Define phi
+phi <- function(x, delta) {
+  result_phi <- delta^2 * (sqrt(1 + (x^2 / delta^2)) - 1)
+  return(sum(result_phi))
+}
+
+# Compute gradient of phi
+grad_phi <- function(x, delta) {
+  result_grad_phi <- x / sqrt(1 + (x/delta)^2)
+  return(result_grad_phi)
+}
+
+# Bregman divergence
+bregman_loss <- function(y, y_hat, delta) {
+  return(phi(y, delta) - phi(y_hat, delta) - sum(grad_phi(y_hat, delta) * (y - y_hat)))
+}
+
+# Gradient of Bregman divergence
+bregman_grad <- function(beta, y, x, delta) {
+  y_hat <- cbind(1, x) %*% beta
+  g <- grad_phi(as.vector(y_hat), delta)
+  g_prime <- 1 / (1 + (y_hat/delta)^2)^(3/2)
+  residual <- as.vector(y - y_hat)
+  grad_term <- -g_prime * residual
+  t(cbind(1, x)) %*% grad_term
+}
+```
+
+We do the same for the Huber loss function:
+
+```{r bregman_imp_function_huber, echo=TRUE}
+# Define phi
+phi_huber <- function(x, delta){
+  result_phi <- ifelse(abs(x) <= delta, x^2/2, delta*(abs(x) - delta /2))
+  return(sum(result_phi))
+}
+
+# Compute gradient of phi
+grad_phi_huber <- function(x, delta) {
+  result_grad_phi <- ifelse(abs(x) <= delta, x, delta*sign(x))
+  return(result_grad_phi)
+}
+
+# Bregman divergence using phi and grad phi
+bregman_loss_huber <- function(y, y_hat, delta) {
+  return(phi_huber(y, delta) - phi_huber(y_hat, delta) 
+         - sum(grad_phi_huber(y_hat, delta) * (y - y_hat)))
+}
+```
+
+As a last step, we define the gradient of the Bregman divergence for the Huber loss:
+
+```{r gradient_huber, echo=TRUE}
+# Define gradient of Bregman function using the second derivative
+bregman_grad_huber <- function(beta, y, x, delta) {
+  # Predict
+  y_hat <- cbind(1, x) %*% beta
+  # First derivative
+  g <- grad_phi_huber(as.vector(y_hat), delta)
+  
+  # Second derivative
+  g_prime <- ifelse(abs(y_hat) <= delta, 1, 0)
+  
+  # Gradient computation
+  residual <- as.vector(y - y_hat)
+  grad_term <- -g_prime * residual 
+  
+  # Return gradient w.r.t. beta
+  t(cbind(1, x)) %*% grad_term
+}
+```
+
+## Generate Data
+We generate data for a linear model with Pareto errors:
+
+```{r gen, echo=TRUE}
+generate_data <- function(n, true_slope, true_intercept, x_m, alpha) {
+  x <- runif(n, 0, 10)
+  errors <- gen_pareto_error(n, x_m, alpha)
+  y <- true_intercept + true_slope * x + errors
+  list(x = x, y = y)
+}
+```
+
+## OLS
+We implement OLS estimation using `lm`:
+
+```{r ols_fit, echo=TRUE}
+fit_ols <- function(x, y) {
+  model <- lm(y ~ x)
+  pred <- predict(model)
+  list(coef = coef(model), pred = pred)
+}
+```
+
+## Bregman
+We implement Bregman estimation using the Pseudo-Huber loss function:
+
+```{r bregman_fit, echo=TRUE}
+fit_bregman <- function(x, y, delta) {
+  current_loss <- function(beta) {
+    y_hat <- cbind(1, x) %*% beta
+    bregman_loss(y, y_hat, delta)
+  }
+  current_grad <- function(beta) {
+    bregman_grad(beta, y, x, delta)
+  }
+  init_beta <- coef(MASS::rlm(y ~ x))
+  result <- optim(
+    par = init_beta,
+    fn = current_loss,
+    gr = current_grad,
+    method = "L-BFGS-B",
+    control = list(maxit = 1000, trace = 0, reltol = 1e-8)
+  )
+  coef <- result$par
+  pred <- cbind(1, x)%*%coef
+  list(coef = coef, pred = pred)
+}
+```
+
+And we do the same for the Huber loss function:
+
+```{r bregman_sim_huber, echo=TRUE}
+fit_bregman_huber <- function(x, y, delta) {
+  current_loss <- function(beta) {
+    y_hat <- cbind(1, x) %*% beta
+    bregman_loss_huber(y, y_hat, delta)
+  }
+  current_grad <- function(beta) {
+    bregman_grad_huber(beta, y, x, delta)
+  }
+  init_beta <- coef(MASS::rlm(y ~ x))
+  result <- optim(
+    par = init_beta,
+    fn = current_loss,
+    method = "BFGS",
+    control = list(maxit = 1000, trace = 0, reltol = 1e-8)
+  )
+  coef <- result$par
+  pred <- cbind(1, x) %*% coef
+  list(coef = coef, pred = pred)
+}
+```
+
+## K-Fold Cross-Validation
+Now we define a function which performs K-fold cross-validation to evaluate `delta` values based on prediction errors:
+
+```{r cv, echo=TRUE}
+cv_delta <- function(x, y, delta_values, K, true_slope, true_intercept) {
+  results <- data.frame(
+    delta = delta_values,
+    mod_mean_mse = NA,
+    mod_mean_mad = NA,
+    mod_mean_mse_int = NA,
+    mod_mean_mad_int = NA,
+    mod_mean_mse_slope = NA,
+    mod_mean_mad_slope = NA,
+    mod_mean_mse_huber = NA,
+    mod_mean_mad_huber = NA,
+    mod_mean_mse_int_huber = NA,
+    mod_mean_mad_int_huber = NA,
+    mod_mean_mse_slope_huber = NA,
+    mod_mean_mad_slope_huber = NA
+  )
+  
+  n <- length(y)
+  folds <- sample(rep(1:K, length.out = n))
+  
+  for (i in seq_along(delta_values)) {
+    delta <- delta_values[i]
+    
+    # Initialize fold-wise error storage
+    mse_folds <- numeric(K)
+    mad_folds <- numeric(K)
+    mse_int_folds <- numeric(K)
+    mad_int_folds <- numeric(K)
+    mse_slope_folds <- numeric(K)
+    mad_slope_folds <- numeric(K)
+    
+    mse_folds_huber <- numeric(K)
+    mad_folds_huber <- numeric(K)
+    mse_int_folds_huber <- numeric(K)
+    mad_int_folds_huber <- numeric(K)
+    mse_slope_folds_huber <- numeric(K)
+    mad_slope_folds_huber <- numeric(K)
+    
+    for (fold in 1:K) {
+      test_idx <- which(folds == fold)
+      train_idx <- setdiff(1:n, test_idx)
+      
+      x_train <- x[train_idx]
+      y_train <- y[train_idx]
+      x_test <- x[test_idx]
+      y_test <- y[test_idx]
+      
+      # Fit Pseudo-Huber
+      fit <- fit_bregman(x_train, y_train, delta)
+      y_pred <- fit$coef[1] + fit$coef[2] * x_test
+      
+      # Fit Huber
+      fit_huber <- fit_bregman_huber(x_train, y_train, delta)
+      y_pred_huber <- fit_huber$coef[1] + fit_huber$coef[2] * x_test
+      
+      # Pseudo-Huber error measures
+      mse_folds[fold] <- sqrt(median((y_test - y_pred)^2))
+      mad_folds[fold] <- median(abs(y_test - y_pred))
+      mse_int_folds[fold] <- sqrt(median((fit$coef[1] - true_intercept)^2))/true_intercept
+      mad_int_folds[fold] <- median(abs(fit$coef[1] - true_intercept))/true_intercept
+      mse_slope_folds[fold] <- sqrt(median((fit$coef[2] - true_slope)^2))/true_slope
+      mad_slope_folds[fold] <- median(abs(fit$coef[2] - true_slope))/true_slope
+      
+      # Huber error measures
+      mse_folds_huber[fold] <- sqrt(median((y_test - y_pred_huber)^2))
+      mad_folds_huber[fold] <- median(abs(y_test - y_pred_huber))
+      mse_int_folds_huber[fold] <- 
+        sqrt(median((fit_huber$coef[1] - true_intercept)^2))/true_intercept
+      mad_int_folds_huber[fold] <- 
+        median(abs(fit_huber$coef[1] - true_intercept))/true_intercept
+      mse_slope_folds_huber[fold] <- 
+        sqrt(median((fit_huber$coef[2] - true_slope)^2))/true_slope
+      mad_slope_folds_huber[fold] <- 
+        median(abs(fit_huber$coef[2] - true_slope))/true_slope
+    }
+    
+    # Aggregate results (means across folds)
+    results$mod_mean_mse[i] <- mean(mse_folds)
+    results$mod_mean_mad[i] <- mean(mad_folds)
+    results$mod_mean_mse_int[i] <- mean(mse_int_folds)
+    results$mod_mean_mad_int[i] <- mean(mad_int_folds)
+    results$mod_mean_mse_slope[i] <- mean(mse_slope_folds)
+    results$mod_mean_mad_slope[i] <- mean(mad_slope_folds) 
+    
+    results$mod_mean_mse_huber[i] <- mean(mse_folds_huber)
+    results$mod_mean_mad_huber[i] <- mean(mad_folds_huber)
+    results$mod_mean_mse_int_huber[i] <- mean(mse_int_folds_huber)
+    results$mod_mean_mad_int_huber[i] <- mean(mad_int_folds_huber) 
+    results$mod_mean_mse_slope_huber[i] <- mean(mse_slope_folds_huber)
+    results$mod_mean_mad_slope_huber[i] <- mean(mad_slope_folds_huber)
+  }
+  
+  return(results)
+}
+```
+
+## Simulation Across 100 Datasets
+We set the parameters and run the cross-validation over 100 datasets:
+
+```{r parameters, echo=TRUE, message=FALSE, warning=FALSE}
+# Set parameters
+set.seed(1)
+n <- 100
+true_intercept <- 1
+true_slope <- 1
+x_m <- 1
+alpha <- 1.2
+K <- 5
+n_datasets <- 100
+delta_values <- seq(0.1, 10, length.out = 100)
+```
+
+```{r simulation, echo=TRUE, message=FALSE, warning=FALSE}
+# Initialize avg_results with one row per delta
+avg_results <- data.frame(
+  delta = delta_values,
+  mod_mean_mse = rep(0, length(delta_values)),
+  mod_mean_mad = rep(0, length(delta_values)),
+  mod_mean_mse_int = rep(0, length(delta_values)),
+  mod_mean_mad_int = rep(0, length(delta_values)),
+  mod_mean_mse_slope = rep(0, length(delta_values)),
+  mod_mean_mad_slope = rep(0, length(delta_values)),
+  mod_mean_mse_huber = rep(0, length(delta_values)),
+  mod_mean_mad_huber = rep(0, length(delta_values)),
+  mod_mean_mse_int_huber = rep(0, length(delta_values)),
+  mod_mean_mad_int_huber = rep(0, length(delta_values)),
+  mod_mean_mse_slope_huber = rep(0, length(delta_values)),
+  mod_mean_mad_slope_huber = rep(0, length(delta_values))
+)
+
+# Run cross-validation for each dataset
+for (d in 1:n_datasets) {
+  # Generate dataset
+  data_cv <- generate_data(n, true_slope, true_intercept, x_m, alpha)
+  x_cv <- data_cv$x
+  y_cv <- data_cv$y
+  
+  # Perform cross-validation
+  cv_results <- cv_delta(x_cv, y_cv, delta_values, K, true_slope, true_intercept)
+  
+  # Accumulate results
+  avg_results$mod_mean_mse <- 
+    avg_results$mod_mean_mse + cv_results$mod_mean_mse
+  avg_results$mod_mean_mad <- 
+    avg_results$mod_mean_mad + cv_results$mod_mean_mad
+  avg_results$mod_mean_mse_int <- 
+    avg_results$mod_mean_mse_int + cv_results$mod_mean_mse_int
+  avg_results$mod_mean_mad_int <- 
+    avg_results$mod_mean_mad_int + cv_results$mod_mean_mad_int
+  avg_results$mod_mean_mse_slope <- 
+    avg_results$mod_mean_mse_slope + cv_results$mod_mean_mse_slope
+  avg_results$mod_mean_mad_slope <- 
+    avg_results$mod_mean_mad_slope + cv_results$mod_mean_mad_slope
+  avg_results$mod_mean_mse_huber <- 
+    avg_results$mod_mean_mse_huber + cv_results$mod_mean_mse_huber
+  avg_results$mod_mean_mad_huber <- 
+    avg_results$mod_mean_mad_huber + cv_results$mod_mean_mad_huber
+  avg_results$mod_mean_mse_int_huber <- 
+    avg_results$mod_mean_mse_int_huber + cv_results$mod_mean_mse_int_huber
+  avg_results$mod_mean_mad_int_huber <- 
+    avg_results$mod_mean_mad_int_huber + cv_results$mod_mean_mad_int_huber
+  avg_results$mod_mean_mse_slope_huber <- 
+    avg_results$mod_mean_mse_slope_huber + cv_results$mod_mean_mse_slope_huber
+  avg_results$mod_mean_mad_slope_huber <- avg_results$mod_mean_mad_slope_huber + cv_results$mod_mean_mad_slope_huber
+}
+
+# Average over all datasets
+avg_results[, -1] <- avg_results[, -1] / n_datasets
+
+
+# Find best delta values
+best_delta_mod_mse <- avg_results$delta[which.min(avg_results$mod_mean_mse)]
+cat("Best delta for the modified MSE (Pseudo Huber):", best_delta_mod_mse, "\n")
+
+best_delta_mod_mse_int <- avg_results$delta[which.min(avg_results$mod_mean_mse_int)]
+cat("Best delta for the modified intercept MSE (Pseudo Huber):", best_delta_mod_mse_int, "\n")
+
+best_delta_mod_mad <- avg_results$delta[which.min(avg_results$mod_mean_mad)]
+cat("Best delta for the modified MAD (Pseudo Huber):", best_delta_mod_mad, "\n")
+
+best_delta_mod_mad_int <- avg_results$delta[which.min(avg_results$mod_mean_mad_int)]
+cat("Best delta for the modified intercept MAD (Pseudo Huber):", best_delta_mod_mad_int, "\n")
+
+best_delta_mod_mse_huber <- avg_results$delta[which.min(avg_results$mod_mean_mse_huber)]
+cat("Best delta for the modified MSE (Huber):", best_delta_mod_mse_huber, "\n")
+
+best_delta_mod_mse_int_huber <- avg_results$delta[which.min(avg_results$mod_mean_mse_int_huber)]
+cat("Best delta for the modified intercept MSE (Huber):", best_delta_mod_mse_int_huber, "\n")
+
+best_delta_mod_mad_huber <- avg_results$delta[which.min(avg_results$mod_mean_mad_huber)]
+cat("Best delta for the modified slope MAD (Huber):", best_delta_mod_mad_huber, "\n")
+
+best_delta_mod_mad_int_huber <- avg_results$delta[which.min(avg_results$mod_mean_mad_int_huber)]
+cat("Best delta for the modified intercept MAD (Huber):", best_delta_mod_mad_int_huber, "\n")
+
+best_delta_mod_mse_slope <- avg_results$delta[which.min(avg_results$mod_mean_mse_slope)]
+cat("Best delta for the modified slope MSE (Pseudo Huber):", best_delta_mod_mse_slope, "\n")
+
+best_delta_mod_mad_slope <- avg_results$delta[which.min(avg_results$mod_mean_mad_slope)]
+cat("Best delta for the modified slope MAD (Pseudo Huber):", best_delta_mod_mad_slope, "\n")
+
+best_delta_mod_mse_slope_huber <- avg_results$delta[which.min(avg_results$mod_mean_mse_slope_huber)]
+cat("Best delta for the modified slope MSE (Huber):", best_delta_mod_mse_slope_huber, "\n")
+
+best_delta_mod_mad_slope_huber <- avg_results$delta[which.min(avg_results$mod_mean_mad_slope_huber)]
+cat("Best delta for the modified slope MAD (Huber):", best_delta_mod_mad_slope_huber, "\n")
+```
+
+## Plots
+We plot the average modified MSE and MAD for slopes and intercepts across the 100 datasets.
+
+```{r cv_plots, echo=TRUE, message=FALSE, warning=FALSE}
+library(ggplot2)
+
+# Plot 1: Modified MSE for Predictions
+ggplot(avg_results, aes(x = delta)) +
+  geom_line(aes(y = mod_mean_mse, color = "Pseudo-Huber")) +
+  geom_line(aes(y = mod_mean_mse_huber, color = "Huber")) +
+  scale_color_manual(values = c("Pseudo-Huber" = "cyan", "Huber" = "blue")) +
+  labs(
+    title = "Average Modified MSE for Predictions vs. Delta",
+    x = "Delta",
+    y = "Average Modified MSE",
+    color = "Method"
+  ) +
+  theme_minimal()
+
+# Plot 2: Modified MSE for Intercepts
+ggplot(avg_results, aes(x = delta)) +
+  geom_line(aes(y = mod_mean_mse_int, color = "Pseudo-Huber")) +
+  geom_line(aes(y = mod_mean_mse_int_huber, color = "Huber")) +
+  scale_color_manual(values = c("Pseudo-Huber" = "cyan", "Huber" = "blue")) +
+  labs(
+    title = "Average Modified MSE for Intercepts vs. Delta",
+    x = "Delta",
+    y = "Average Modified MSE",
+    color = "Method"
+  ) +
+  theme_minimal()
+
+# Plot 3: Modified MSE for Slopes
+ggplot(avg_results, aes(x = delta)) +
+  geom_line(aes(y = mod_mean_mse_slope, color = "Pseudo-Huber")) +
+  geom_line(aes(y = mod_mean_mse_slope_huber, color = "Huber")) +
+  scale_color_manual(values = c("Pseudo-Huber" = "cyan", "Huber" = "blue")) +
+  labs(
+    title = "Average Modified MSE for Slopes vs. Delta",
+    x = "Delta",
+    y = "Average Modified MSE",
+    color = "Method"
+  ) +
+  theme_minimal()
+
+# Plot 4: Modified MAD for Predictions
+ggplot(avg_results, aes(x = delta)) +
+  geom_line(aes(y = mod_mean_mad, color = "Pseudo-Huber")) +
+  geom_line(aes(y = mod_mean_mad_huber, color = "Huber")) +
+  scale_color_manual(values = c("Pseudo-Huber" = "cyan", "Huber" = "blue")) +
+  labs(
+    title = "Average Modified MAD for Predictions vs. Delta",
+    x = "Delta",
+    y = "Average Modified MAD",
+    color = "Method"
+  ) +
+  theme_minimal()
+
+# Plot 5: Modified MAD for Intercepts
+ggplot(avg_results, aes(x = delta)) +
+  geom_line(aes(y = mod_mean_mad_int, color = "Pseudo-Huber")) +
+  geom_line(aes(y = mod_mean_mad_int_huber, color = "Huber")) +
+  scale_color_manual(values = c("Pseudo-Huber" = "cyan", "Huber" = "blue")) +
+  labs(
+    title = "Average Modified MAD for Intercepts vs. Delta",
+    x = "Delta",
+    y = "Average Modified MAD",
+    color = "Method"
+  ) +
+  theme_minimal()
+
+# Plot 6: Modified MAD for Slopes
+ggplot(avg_results, aes(x = delta)) +
+  geom_line(aes(y = mod_mean_mad_slope, color = "Pseudo-Huber")) +
+  geom_line(aes(y = mod_mean_mad_slope_huber, color = "Huber")) +
+  scale_color_manual(values = c("Pseudo-Huber" = "cyan", "Huber" = "blue")) +
+  labs(
+    title = "Average Modified MAD for Slopes vs. Delta",
+    x = "Delta",
+    y = "Average Modified MAD",
+    color = "Method"
+  ) +
+  theme_minimal()
+```
